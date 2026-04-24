@@ -676,8 +676,9 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
       
       if (shouldBeConnected && !isConnected) {
         if (peer.id > p.peerId) {
+          console.log('[Voice] Initiating call to', p.peerId, '(player', p.id, p.name, ')');
           const call = peer.call(p.peerId, myStreamRef.current!);
-          if (!call) return;
+          if (!call) { console.warn('[Voice] peer.call returned null for', p.peerId); return; }
           const timeoutId = window.setTimeout(() => {
             const activeCall = activeCalls.current.get(p.id);
             if (!activeCall || activeCall.streamAdded) return;
@@ -687,7 +688,8 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
           }, CALL_CONNECT_TIMEOUT_MS);
 
           activeCalls.current.set(p.id, { call, streamAdded: false, timeoutId });
-          call.on('stream', (s) => { 
+          call.on('stream', (s: MediaStream) => { 
+            console.log('[Voice] Got stream from', p.peerId, '(player', p.id, ') — tracks:', s.getTracks().length);
             audioEngine?.addRemoteStream(p.id, s); 
             if (activeCalls.current.has(p.id)) {
               const activeCall = activeCalls.current.get(p.id)!;
@@ -1023,12 +1025,16 @@ export default function App() {
   const registerPeerCallHandlers = useCallback((peer: Peer) => {
     const handleCall = (call: any) => {
       const stream = myStreamRef.current;
+      console.log('[Voice] Incoming call from', call.peer, '— answering with', stream ? 'live stream' : 'silent stream');
       if (stream) call.answer(stream);
       else call.answer(createSilentStream());
 
       call.on('stream', (remoteStream: MediaStream) => {
+        console.log('[Voice] Received remote stream from', call.peer, '— tracks:', remoteStream.getTracks().length);
         attachRemoteStreamByPeerId(call.peer, remoteStream);
       });
+      call.on('error', (err: any) => console.warn('[Voice] Incoming call error from', call.peer, err));
+      call.on('close', () => console.log('[Voice] Incoming call closed from', call.peer));
     };
 
     peer.on('call', handleCall);
@@ -1063,8 +1069,10 @@ export default function App() {
     const peer = new Peer(buildPeerOptions(iceServers)); peerRef.current = peer;
     registerPeerCallHandlers(peer);
     peer.on('open', (id) => {
-      const isLocal = window.location.hostname === 'localhost' || window.location.hostname.match(/\d+\.\d+\.\d+\.\d+/);
-      const socket = io(isLocal ? `http://${window.location.hostname}:3001` : '/');
+      console.log('[Voice] PeerJS open with id:', id);
+      // Always connect to same origin — Vite proxy handles dev mode,
+      // and in production everything is served from the same port.
+      const socket = io('/');
       socketRef.current = socket;
       socket.emit('join', {
         name,
@@ -1096,8 +1104,9 @@ export default function App() {
       setJoined(true);
     });
     peer.on('error', (error) => {
-      console.error('PeerJS connection error', error);
+      console.error('[Voice] PeerJS connection error', error);
     });
+    peer.on('disconnected', () => console.warn('[Voice] PeerJS disconnected from signaling server'));
   }, [createSilentStream, registerPeerCallHandlers, resolveIceServers, userColor]);
 
   useEffect(() => {
