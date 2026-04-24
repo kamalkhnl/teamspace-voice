@@ -1167,7 +1167,11 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
             cleanupCall(peerKey, true);
           });
         }
-      } else if (crossedRoomBoundary || (!shouldBeConnected && isConnected && d > 450)) {
+      } else if (crossedRoomBoundary) {
+        disconnectAfterByPeerId.current.delete(peerKey);
+        console.log('[Voice] Closing call for', p.name, 'immediately due to zone boundary change');
+        closeCall(peerKey, false);
+      } else if (!shouldBeConnected && isConnected && d > 450) {
         const disconnectAfter = disconnectAfterByPeerId.current.get(peerKey) ?? (Date.now() + PROXIMITY_DISCONNECT_GRACE_MS);
         disconnectAfterByPeerId.current.set(peerKey, disconnectAfter);
 
