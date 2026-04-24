@@ -68,6 +68,8 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   },
 ];
 const CALL_CONNECT_TIMEOUT_MS = 8000;
+const CALL_RETRY_COOLDOWN_MS = 4000;
+const ICE_DISCONNECT_GRACE_MS = 7000;
 
 function getClientInstanceId(): string {
   if (typeof window === 'undefined') return Math.random().toString(36).slice(2);
@@ -637,7 +639,8 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
   const syncTick = useRef(0);
   const lastTimeRef = useRef(performance.now());
   const accumulatorRef = useRef(0);
-  const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean; timeoutId: number | null }>>(new Map());
+  const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean; timeoutId: number | null; disconnectTimeoutId: number | null; playerId: string }>>(new Map());
+  const retryAfterByPeerId = useRef<Map<string, number>>(new Map());
   
   // REFS for stability in the physics/render loop
   const remotePlayersRef = useRef(remotePlayers);
@@ -714,6 +717,43 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
   // Proximity and Audio logic moved out of useEffect to avoid recreation
   function manageProximityCalls() {
     if (!peer || !myStreamRef.current) return;
+
+    const clearCallTimers = (entry: { timeoutId: number | null; disconnectTimeoutId: number | null }) => {
+      if (entry.timeoutId != null) {
+        window.clearTimeout(entry.timeoutId);
+        entry.timeoutId = null;
+      }
+      if (entry.disconnectTimeoutId != null) {
+        window.clearTimeout(entry.disconnectTimeoutId);
+        entry.disconnectTimeoutId = null;
+      }
+    };
+
+    const markRetryCooldown = (peerId: string) => {
+      retryAfterByPeerId.current.set(peerId, Date.now() + CALL_RETRY_COOLDOWN_MS);
+    };
+
+    const cleanupCall = (peerId: string, markRetry: boolean) => {
+      const activeCall = activeCalls.current.get(peerId);
+      if (!activeCall) return;
+
+      clearCallTimers(activeCall);
+      audioEngine?.removeUser(activeCall.playerId);
+      activeCalls.current.delete(peerId);
+      if (markRetry) markRetryCooldown(peerId);
+    };
+
+    const closeCall = (peerId: string, markRetry: boolean) => {
+      const activeCall = activeCalls.current.get(peerId);
+      if (!activeCall) return;
+
+      try {
+        activeCall.call.close();
+      } catch {}
+
+      cleanupCall(peerId, markRetry);
+    };
+
     const up = userPos.current, myZone = getZoneAtPosition(up);
     Object.values(remotePlayersRef.current || {}).forEach(p => {
       if (!p || !p.peerId) return;
@@ -721,7 +761,13 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
       const sharingRoom = Boolean(myZone && otherZone === myZone);
       const sharingOpenFloor = !myZone && !otherZone && d < 350;
       const shouldBeConnected = sharingRoom || sharingOpenFloor;
-      const isConnected = activeCalls.current.has(p.id);
+      const peerKey = p.peerId;
+      const existingCall = activeCalls.current.get(peerKey);
+      if (existingCall && existingCall.playerId !== p.id) {
+        audioEngine?.removeUser(existingCall.playerId);
+        existingCall.playerId = p.id;
+      }
+      const isConnected = Boolean(existingCall);
       const crossedRoomBoundary =
         !sharingRoom &&
         !sharingOpenFloor &&
@@ -729,19 +775,21 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
         Boolean(myZone || otherZone);
       
       if (shouldBeConnected && !isConnected) {
+        const retryAfter = retryAfterByPeerId.current.get(peerKey) ?? 0;
+        if (retryAfter > Date.now()) return;
+
         if (peer.id > p.peerId) {
           console.log('[Voice] Initiating call to', p.peerId, '(player', p.id, p.name, ')');
           const call = peer.call(p.peerId, myStreamRef.current!);
           if (!call) { console.warn('[Voice] peer.call returned null for', p.peerId); return; }
           const timeoutId = window.setTimeout(() => {
-            const activeCall = activeCalls.current.get(p.id);
+            const activeCall = activeCalls.current.get(peerKey);
             if (!activeCall || activeCall.streamAdded) return;
-            activeCall.call.close();
-            audioEngine?.removeUser(p.id);
-            activeCalls.current.delete(p.id);
+            console.warn('[Voice] Call connect timeout for', p.name, '- retrying soon');
+            closeCall(peerKey, true);
           }, CALL_CONNECT_TIMEOUT_MS);
 
-          activeCalls.current.set(p.id, { call, streamAdded: false, timeoutId });
+          activeCalls.current.set(peerKey, { call, streamAdded: false, timeoutId, disconnectTimeoutId: null, playerId: p.id });
 
           // Monitor ICE connection state to diagnose TURN / connectivity issues
           try {
@@ -751,6 +799,26 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
                 console.log('[Voice] ICE state for', p.name, ':', pc.iceConnectionState);
                 if (pc.iceConnectionState === 'failed') {
                   console.error('[Voice] ICE FAILED for', p.name, '— TURN server may be unreachable');
+                  closeCall(peerKey, true);
+                } else if (pc.iceConnectionState === 'disconnected') {
+                  const activeCall = activeCalls.current.get(peerKey);
+                  if (!activeCall || activeCall.disconnectTimeoutId != null) return;
+                  activeCall.disconnectTimeoutId = window.setTimeout(() => {
+                    const latest = activeCalls.current.get(peerKey);
+                    if (!latest) return;
+                    const latestPc = latest.call.peerConnection as RTCPeerConnection | undefined;
+                    if (!latestPc || latestPc.iceConnectionState === 'connected' || latestPc.iceConnectionState === 'completed') {
+                      latest.disconnectTimeoutId = null;
+                      return;
+                    }
+                    console.warn('[Voice] ICE stayed disconnected for', p.name, '- reconnecting');
+                    closeCall(peerKey, true);
+                  }, ICE_DISCONNECT_GRACE_MS);
+                } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                  const activeCall = activeCalls.current.get(peerKey);
+                  if (!activeCall || activeCall.disconnectTimeoutId == null) return;
+                  window.clearTimeout(activeCall.disconnectTimeoutId);
+                  activeCall.disconnectTimeoutId = null;
                 }
               };
               pc.onicecandidate = (e) => {
@@ -764,35 +832,23 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
           call.on('stream', (s: MediaStream) => { 
             console.log('[Voice] Got stream from', p.peerId, '(player', p.id, ') — tracks:', s.getTracks().length);
             audioEngine?.addRemoteStream(p.id, s); 
-            if (activeCalls.current.has(p.id)) {
-              const activeCall = activeCalls.current.get(p.id)!;
+            if (activeCalls.current.has(peerKey)) {
+              const activeCall = activeCalls.current.get(peerKey)!;
+              activeCall.playerId = p.id;
               activeCall.streamAdded = true;
-              if (activeCall.timeoutId != null) {
-                window.clearTimeout(activeCall.timeoutId);
-                activeCall.timeoutId = null;
-              }
+              clearCallTimers(activeCall);
             }
           });
           call.on('close', () => {
-            const activeCall = activeCalls.current.get(p.id);
-            if (activeCall?.timeoutId != null) window.clearTimeout(activeCall.timeoutId);
-            audioEngine?.removeUser(p.id);
-            activeCalls.current.delete(p.id);
+            cleanupCall(peerKey, true);
           });
           call.on('error', (e: any) => {
-            const activeCall = activeCalls.current.get(p.id);
-            if (activeCall?.timeoutId != null) window.clearTimeout(activeCall.timeoutId);
             console.warn('[Voice] Call error', e);
-            audioEngine?.removeUser(p.id);
-            activeCalls.current.delete(p.id);
+            cleanupCall(peerKey, true);
           });
         }
       } else if (crossedRoomBoundary || (!shouldBeConnected && isConnected && d > 450)) {
-        const activeCall = activeCalls.current.get(p.id);
-        if (activeCall?.timeoutId != null) window.clearTimeout(activeCall.timeoutId);
-        activeCall?.call.close();
-        audioEngine?.removeUser(p.id); 
-        activeCalls.current.delete(p.id);
+        closeCall(peerKey, false);
       }
     });
   }
@@ -957,6 +1013,7 @@ export default function App() {
   const myStreamRef = useRef<MediaStream | null>(null);
   const audioEngineRef = useRef(new SpatialAudioEngine());
   const pendingRemoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  const incomingCallsRef = useRef<Map<string, any>>(new Map());
   const audioCtxRef = useRef<AudioContext | null>(null);
   const dummyAudioCtxRef = useRef<AudioContext | null>(null);
   const speechReqRef = useRef<number>(0);
@@ -1106,6 +1163,15 @@ export default function App() {
 
   const registerPeerCallHandlers = useCallback((peer: Peer) => {
     const handleCall = (call: any) => {
+      const existingIncomingCall = incomingCallsRef.current.get(call.peer);
+      if (existingIncomingCall && existingIncomingCall !== call) {
+        try {
+          existingIncomingCall.close();
+        } catch {}
+      }
+
+      incomingCallsRef.current.set(call.peer, call);
+
       const stream = myStreamRef.current;
       console.log('[Voice] Incoming call from', call.peer, '— answering with', stream ? 'live stream' : 'silent stream');
       if (stream) call.answer(stream);
@@ -1115,8 +1181,12 @@ export default function App() {
         console.log('[Voice] Received remote stream from', call.peer, '— tracks:', remoteStream.getTracks().length);
         attachRemoteStreamByPeerId(call.peer, remoteStream);
       });
-      call.on('error', (err: any) => console.warn('[Voice] Incoming call error from', call.peer, err));
+      call.on('error', (err: any) => {
+        if (incomingCallsRef.current.get(call.peer) === call) incomingCallsRef.current.delete(call.peer);
+        console.warn('[Voice] Incoming call error from', call.peer, err);
+      });
       call.on('close', () => {
+        if (incomingCallsRef.current.get(call.peer) === call) incomingCallsRef.current.delete(call.peer);
         console.log('[Voice] Incoming call closed from', call.peer);
         const callerId = Object.keys(remotePlayersRef.current).find(id => remotePlayersRef.current[id].peerId === call.peer);
         if (callerId) audioEngineRef.current.removeUser(callerId);
@@ -1124,7 +1194,15 @@ export default function App() {
     };
 
     peer.on('call', handleCall);
-    return () => { peer.off('call', handleCall); };
+    return () => {
+      peer.off('call', handleCall);
+      for (const incomingCall of incomingCallsRef.current.values()) {
+        try {
+          incomingCall.close();
+        } catch {}
+      }
+      incomingCallsRef.current.clear();
+    };
   }, [attachRemoteStreamByPeerId, createSilentStream]);
 
   const ensureAudioDeviceAccess = useCallback(async () => {
