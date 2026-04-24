@@ -1067,7 +1067,8 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
                 peerId: p.peerId,
                 iceTransportPolicy: pc.getConfiguration()?.iceTransportPolicy,
               });
-              pc.oniceconnectionstatechange = () => {
+
+              const onIceConnectionStateChange = () => {
                 console.log('[Voice] ICE state for', p.name, ':', pc.iceConnectionState);
                 if (pc.iceConnectionState === 'failed') {
                   console.error('[Voice] ICE FAILED for', p.name, '— TURN server may be unreachable');
@@ -1081,7 +1082,8 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
                   activeCall.disconnectTimeoutId = null;
                 }
               };
-              pc.onconnectionstatechange = () => {
+
+              const onConnectionStateChange = () => {
                 voiceDebug('Peer connection state changed', {
                   peerId: p.peerId,
                   playerName: p.name,
@@ -1098,25 +1100,45 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
                   }
                 }
               };
-              pc.onsignalingstatechange = () => {
+
+              const onSignalingStateChange = () => {
                 voiceDebug('Peer signaling state changed', {
                   peerId: p.peerId,
                   playerName: p.name,
                   signalingState: pc.signalingState,
                 });
               };
-              pc.onicegatheringstatechange = () => {
+
+              const onIceGatheringStateChange = () => {
                 voiceDebug('ICE gathering state changed', {
                   peerId: p.peerId,
                   playerName: p.name,
                   iceGatheringState: pc.iceGatheringState,
                 });
               };
-              pc.onicecandidate = (e) => {
+
+              const onIceCandidate = (e: RTCPeerConnectionIceEvent) => {
                 if (e.candidate) {
                   console.log('[Voice] ICE candidate:', e.candidate.type, e.candidate.protocol, e.candidate.address);
                 }
               };
+
+              pc.addEventListener('iceconnectionstatechange', onIceConnectionStateChange);
+              pc.addEventListener('connectionstatechange', onConnectionStateChange);
+              pc.addEventListener('signalingstatechange', onSignalingStateChange);
+              pc.addEventListener('icegatheringstatechange', onIceGatheringStateChange);
+              pc.addEventListener('icecandidate', onIceCandidate);
+
+              const cleanupPeerListeners = () => {
+                pc.removeEventListener('iceconnectionstatechange', onIceConnectionStateChange);
+                pc.removeEventListener('connectionstatechange', onConnectionStateChange);
+                pc.removeEventListener('signalingstatechange', onSignalingStateChange);
+                pc.removeEventListener('icegatheringstatechange', onIceGatheringStateChange);
+                pc.removeEventListener('icecandidate', onIceCandidate);
+              };
+
+              call.on('close', cleanupPeerListeners);
+              call.on('error', cleanupPeerListeners);
             }
           } catch (_) {}
 
@@ -1582,7 +1604,7 @@ export default function App() {
       try {
         const pc = call.peerConnection as RTCPeerConnection | undefined;
         if (pc) {
-          pc.onconnectionstatechange = () => {
+          const onConnectionStateChange = () => {
             voiceDebug('Incoming peer connection state changed', {
               peerId: call.peer,
               connectionState: pc.connectionState,
@@ -1595,24 +1617,42 @@ export default function App() {
               } catch {}
             }
           };
-          pc.onsignalingstatechange = () => {
+
+          const onSignalingStateChange = () => {
             voiceDebug('Incoming signaling state changed', {
               peerId: call.peer,
               signalingState: pc.signalingState,
             });
           };
-          pc.onicegatheringstatechange = () => {
+
+          const onIceGatheringStateChange = () => {
             voiceDebug('Incoming ICE gathering state changed', {
               peerId: call.peer,
               iceGatheringState: pc.iceGatheringState,
             });
           };
-          pc.oniceconnectionstatechange = () => {
+
+          const onIceConnectionStateChange = () => {
             voiceDebug('Incoming ICE state changed', {
               peerId: call.peer,
               iceConnectionState: pc.iceConnectionState,
             });
           };
+
+          pc.addEventListener('connectionstatechange', onConnectionStateChange);
+          pc.addEventListener('signalingstatechange', onSignalingStateChange);
+          pc.addEventListener('icegatheringstatechange', onIceGatheringStateChange);
+          pc.addEventListener('iceconnectionstatechange', onIceConnectionStateChange);
+
+          const cleanupIncomingPeerListeners = () => {
+            pc.removeEventListener('connectionstatechange', onConnectionStateChange);
+            pc.removeEventListener('signalingstatechange', onSignalingStateChange);
+            pc.removeEventListener('icegatheringstatechange', onIceGatheringStateChange);
+            pc.removeEventListener('iceconnectionstatechange', onIceConnectionStateChange);
+          };
+
+          call.on('close', cleanupIncomingPeerListeners);
+          call.on('error', cleanupIncomingPeerListeners);
         }
       } catch {}
 
