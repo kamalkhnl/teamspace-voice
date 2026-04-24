@@ -28,11 +28,11 @@ network_name="${project_name}_gather-net"
 
 if ! docker network inspect "$network_name" >/dev/null 2>&1; then
   echo "Docker network '$network_name' not found. Starting app service first..."
-  docker compose up -d app
+  docker compose up -d --build app
 fi
 
 echo "Starting app service..."
-docker compose up -d app
+docker compose up -d --build app
 
 echo ""
 echo "Starting Cloudflare Quick Tunnel (no domain required)..."
