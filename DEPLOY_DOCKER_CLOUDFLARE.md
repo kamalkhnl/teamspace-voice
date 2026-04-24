@@ -2,6 +2,25 @@
 
 This guide deploys the app on an Ubuntu server inside a company network without opening inbound ports.
 
+## No Domain Option (Cloudflare Free)
+
+If you do not own a domain, use a Cloudflare Quick Tunnel.
+
+- You get a temporary URL like `https://random-name.trycloudflare.com`
+- No DNS setup is needed
+- URL changes whenever you restart the quick tunnel
+
+Run from the project root:
+
+```bash
+chmod +x scripts/quick_tunnel.sh
+sudo ./scripts/quick_tunnel.sh
+```
+
+Keep that terminal open. The public `trycloudflare.com` URL is shown in the output.
+
+Use this for testing/demo. For a stable URL, you need a domain in Cloudflare and a token-based named tunnel.
+
 ## 1) Prerequisites
 
 - Ubuntu server with SSH access
@@ -49,6 +68,19 @@ Edit `.env` and set your Cloudflare tunnel token:
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=your_real_token_here
 ```
+
+For internet voice, configure TURN on the server side and keep `VITE_PEER_ICE_SERVERS` as a fallback only.
+
+Recommended `.env` entries:
+
+```dotenv
+TURN_URLS=turn:turn.yourcompany.com:3478?transport=udp,turns:turn.yourcompany.com:5349?transport=tcp
+TURN_SHARED_SECRET=your_long_random_secret
+TURN_TTL_SECONDS=86400
+VITE_PEER_ICE_SERVERS=[{"urls":["stun:stun.l.google.com:19302","stun:stun1.l.google.com:19302"]}]
+```
+
+The app now fetches `/api/ice-servers` at runtime. That endpoint generates short-lived TURN credentials from `TURN_SHARED_SECRET`, which is safer than shipping static TURN passwords in the frontend.
 
 ## 4) Create Cloudflare Tunnel (Dashboard)
 
@@ -117,4 +149,21 @@ docker compose --env-file .env restart
 
 Your app uses WebRTC for media, so signaling through Cloudflare Tunnel does not guarantee media connectivity in strict corporate NAT/firewall environments.
 
-If voice fails for some users, add a TURN server and configure ICE servers in the client.
+This repo now supports runtime-issued TURN credentials from `/api/ice-servers`, but clients must still be able to reach the TURN server directly.
+
+Recommended production setup:
+
+1. Keep Cloudflare Tunnel for HTTPS and app signaling.
+2. Run `coturn` on the VM or another host.
+3. Forward company edge NAT/firewall traffic to the VM for:
+   - UDP/TCP `3478`
+   - TCP `5349`
+   - Relay UDP range `49160-49200` or whatever you configure in `turnserver.conf`
+4. Point `TURN_URLS` at the public hostname or IP that resolves to those forwarded ports.
+5. Rebuild and redeploy:
+
+```bash
+docker compose --env-file .env up -d --build
+```
+
+Important constraint: Cloudflare Tunnel does not proxy TURN media. If your company network will not forward TURN ports to the VM, self-hosted TURN on this VM will not be reachable from browsers on the public internet.

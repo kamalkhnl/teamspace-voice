@@ -4,7 +4,7 @@ import Peer from 'peerjs';
 import { 
   Mic, MicOff, LogOut, Sun, Moon, 
   Monitor, Volume2, Building2, Users, 
-  MapPin, Headphones, ArrowRight 
+  MapPin, Headphones, ArrowRight, Check, ChevronUp
 } from 'lucide-react';
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -58,6 +58,107 @@ const MIC_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
 
 const PLAYBACK_ATTENUATION = 0.72;
 const LOCAL_TALK_DUCKING = 0.18;
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  {
+    urls: [
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+    ],
+  },
+];
+const CALL_CONNECT_TIMEOUT_MS = 8000;
+
+function getClientInstanceId(): string {
+  if (typeof window === 'undefined') return Math.random().toString(36).slice(2);
+
+  const existing = window.sessionStorage.getItem('client-instance-id');
+  if (existing) return existing;
+
+  const generated = crypto.randomUUID();
+  window.sessionStorage.setItem('client-instance-id', generated);
+  return generated;
+}
+
+function getDeviceLabel(device: MediaDeviceInfo, fallbackPrefix: string): string {
+  const label = device.label?.trim();
+  return label || `${fallbackPrefix} ${device.deviceId.slice(0, 6)}`;
+}
+
+function parseBooleanEnv(value: string | undefined): boolean | undefined {
+  if (value == null || value === '') return undefined;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return undefined;
+}
+
+function parseIceServersFromEnv(): RTCIceServer[] {
+  const rawIceServers = import.meta.env.VITE_PEER_ICE_SERVERS?.trim();
+  if (!rawIceServers) return DEFAULT_ICE_SERVERS;
+
+  try {
+    const parsed = JSON.parse(rawIceServers);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed;
+    }
+    console.warn('VITE_PEER_ICE_SERVERS must be a non-empty JSON array. Falling back to default STUN.');
+  } catch (error) {
+    console.warn('Failed to parse VITE_PEER_ICE_SERVERS. Falling back to default STUN.', error);
+  }
+
+  return DEFAULT_ICE_SERVERS;
+}
+
+async function resolveIceServers(): Promise<RTCIceServer[]> {
+  try {
+    const res = await fetch('/api/ice-servers', { cache: 'no-store' });
+    if (!res.ok) {
+      throw new Error(`ICE server endpoint returned ${res.status}`);
+    }
+
+    const data = await res.json();
+    if (Array.isArray(data?.iceServers) && data.iceServers.length > 0) {
+      return data.iceServers;
+    }
+
+    throw new Error('ICE server endpoint returned no iceServers');
+  } catch (error) {
+    console.warn('Falling back to static ICE server configuration.', error);
+    return parseIceServersFromEnv();
+  }
+}
+
+function buildPeerOptions(iceServers: RTCIceServer[]) {
+  const options: Record<string, unknown> = {
+    config: { iceServers },
+    debug: 1,
+  };
+
+  const host = import.meta.env.VITE_PEER_HOST?.trim();
+  const path = import.meta.env.VITE_PEER_PATH?.trim();
+  const portRaw = import.meta.env.VITE_PEER_PORT?.trim();
+  const secure = parseBooleanEnv(import.meta.env.VITE_PEER_SECURE);
+
+  if (host) {
+    options.host = host;
+  } else if (typeof window !== 'undefined') {
+    // Default to the current origin so PeerJS signaling stays on this app host
+    // instead of falling back to the public PeerJS cloud server.
+    options.host = window.location.hostname;
+    if (window.location.port) {
+      const currentPort = Number(window.location.port);
+      if (!Number.isNaN(currentPort)) options.port = currentPort;
+    }
+    options.secure = window.location.protocol === 'https:';
+  }
+  if (path) options.path = path;
+  if (portRaw) {
+    const port = Number(portRaw);
+    if (!Number.isNaN(port)) options.port = port;
+  }
+  if (secure !== undefined) options.secure = secure;
+
+  return options;
+}
 
 function buildPreferredMicConstraints(): MediaTrackConstraints {
   const supported = navigator.mediaDevices?.getSupportedConstraints?.() ?? {};
@@ -209,6 +310,7 @@ function getRandomSpawn(): Position {
 class SpatialAudioEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
+  private outputDeviceId = 'default';
   private userNodes: Map<string, { 
     source: MediaElementAudioSourceNode; 
     gain: GainNode; 
@@ -238,6 +340,18 @@ class SpatialAudioEngine {
     if (this.ctx && this.ctx.state === 'suspended') await this.ctx.resume();
   }
 
+  async setOutputDevice(deviceId: string): Promise<void> {
+    this.outputDeviceId = deviceId;
+
+    await Promise.all(
+      Array.from(this.userNodes.values()).map(({ audioEl }) => {
+        const sinkTarget = deviceId === 'default' ? '' : deviceId;
+        const sinkSetter = (audioEl as HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> }).setSinkId;
+        return sinkSetter ? sinkSetter.call(audioEl, sinkTarget) : Promise.resolve();
+      })
+    );
+  }
+
   addRemoteStream(id: string, stream: MediaStream): void {
     if (!this.ctx || !this.masterGain) return;
     this.removeUser(id);
@@ -251,6 +365,11 @@ class SpatialAudioEngine {
     audioEl.disableRemotePlayback = true;
     audioEl.muted = false;
     audioEl.volume = 1;
+    const sinkSetter = (audioEl as HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> }).setSinkId;
+    if (sinkSetter) {
+      const sinkTarget = this.outputDeviceId === 'default' ? '' : this.outputDeviceId;
+      sinkSetter.call(audioEl, sinkTarget).catch((e) => console.warn('Failed to set audio output device', e));
+    }
     
     // Ensure context is running when a new stream arrives
     if (this.ctx.state === 'suspended') this.ctx.resume();
@@ -464,7 +583,7 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
   const syncTick = useRef(0);
   const lastTimeRef = useRef(performance.now());
   const accumulatorRef = useRef(0);
-  const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean }>>(new Map());
+  const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean; timeoutId: number | null }>>(new Map());
   
   // REFS for stability in the physics/render loop
   const remotePlayersRef = useRef(remotePlayers);
@@ -559,16 +678,44 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
         if (peer.id > p.peerId) {
           const call = peer.call(p.peerId, myStreamRef.current!);
           if (!call) return;
-          activeCalls.current.set(p.id, { call, streamAdded: false });
+          const timeoutId = window.setTimeout(() => {
+            const activeCall = activeCalls.current.get(p.id);
+            if (!activeCall || activeCall.streamAdded) return;
+            activeCall.call.close();
+            audioEngine?.removeUser(p.id);
+            activeCalls.current.delete(p.id);
+          }, CALL_CONNECT_TIMEOUT_MS);
+
+          activeCalls.current.set(p.id, { call, streamAdded: false, timeoutId });
           call.on('stream', (s) => { 
             audioEngine?.addRemoteStream(p.id, s); 
-            if (activeCalls.current.has(p.id)) activeCalls.current.get(p.id)!.streamAdded = true;
+            if (activeCalls.current.has(p.id)) {
+              const activeCall = activeCalls.current.get(p.id)!;
+              activeCall.streamAdded = true;
+              if (activeCall.timeoutId != null) {
+                window.clearTimeout(activeCall.timeoutId);
+                activeCall.timeoutId = null;
+              }
+            }
           });
-          call.on('close', () => { audioEngine?.removeUser(p.id); activeCalls.current.delete(p.id); });
-          call.on('error', (e: any) => { console.warn('Call error', e); audioEngine?.removeUser(p.id); activeCalls.current.delete(p.id); });
+          call.on('close', () => {
+            const activeCall = activeCalls.current.get(p.id);
+            if (activeCall?.timeoutId != null) window.clearTimeout(activeCall.timeoutId);
+            audioEngine?.removeUser(p.id);
+            activeCalls.current.delete(p.id);
+          });
+          call.on('error', (e: any) => {
+            const activeCall = activeCalls.current.get(p.id);
+            if (activeCall?.timeoutId != null) window.clearTimeout(activeCall.timeoutId);
+            console.warn('Call error', e);
+            audioEngine?.removeUser(p.id);
+            activeCalls.current.delete(p.id);
+          });
         }
       } else if (crossedRoomBoundary || (!shouldBeConnected && isConnected && d > 450)) {
-        activeCalls.current.get(p.id)?.call.close();
+        const activeCall = activeCalls.current.get(p.id);
+        if (activeCall?.timeoutId != null) window.clearTimeout(activeCall.timeoutId);
+        activeCall?.call.close();
         audioEngine?.removeUser(p.id); 
         activeCalls.current.delete(p.id);
       }
@@ -722,16 +869,87 @@ export default function App() {
   // FIX: myStream is kept in STATE so OfficeCanvas re-renders and the incoming-call
   // handler effect re-runs whenever the stream changes (e.g. after enable/unmute).
   const [myStream, setMyStream] = useState<MediaStream | null>(null);
+  const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
+  const [audioOutputDevices, setAudioOutputDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedInputDeviceId, setSelectedInputDeviceId] = useState('default');
+  const [selectedOutputDeviceId, setSelectedOutputDeviceId] = useState('default');
+  const [canSelectOutputDevice, setCanSelectOutputDevice] = useState(false);
+  const [audioMenuOpen, setAudioMenuOpen] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const myStreamRef = useRef<MediaStream | null>(null);
   const audioEngineRef = useRef(new SpatialAudioEngine());
+  const pendingRemoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const audioCtxRef = useRef<AudioContext | null>(null);
   const dummyAudioCtxRef = useRef<AudioContext | null>(null);
   const speechReqRef = useRef<number>(0);
   const remotePlayersRef = useRef(remotePlayers);
+  const clientInstanceIdRef = useRef(getClientInstanceId());
+  const hiddenLeaveTimeoutRef = useRef<number | null>(null);
+  const audioMenuRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => { remotePlayersRef.current = remotePlayers; }, [remotePlayers]);
+
+  const refreshAudioDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    setAudioInputDevices(devices.filter(device => device.kind === 'audioinput'));
+    setAudioOutputDevices(devices.filter(device => device.kind === 'audiooutput'));
+  }, []);
+
+  useEffect(() => {
+    const supportsSinkSelection =
+      typeof window !== 'undefined' &&
+      'setSinkId' in HTMLMediaElement.prototype;
+
+    setCanSelectOutputDevice(supportsSinkSelection);
+
+    refreshAudioDevices().catch(() => {});
+    navigator.mediaDevices.addEventListener?.('devicechange', refreshAudioDevices);
+
+    return () => {
+      navigator.mediaDevices.removeEventListener?.('devicechange', refreshAudioDevices);
+    };
+  }, [refreshAudioDevices]);
+
+  useEffect(() => {
+    if (!audioMenuOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!audioMenuRef.current?.contains(event.target as Node)) {
+        setAudioMenuOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+    };
+  }, [audioMenuOpen]);
+
+  const attachRemoteStreamByPeerId = useCallback((peerId: string, remoteStream: MediaStream) => {
+    const callerId = Object.keys(remotePlayersRef.current).find(
+      id => remotePlayersRef.current[id].peerId === peerId
+    );
+
+    if (callerId) {
+      audioEngineRef.current.addRemoteStream(callerId, remoteStream);
+      pendingRemoteStreamsRef.current.delete(peerId);
+      return;
+    }
+
+    pendingRemoteStreamsRef.current.set(peerId, remoteStream);
+  }, []);
+
+  useEffect(() => {
+    for (const player of Object.values(remotePlayers)) {
+      if (!player.peerId) continue;
+      const pendingStream = pendingRemoteStreamsRef.current.get(player.peerId);
+      if (!pendingStream) continue;
+      audioEngineRef.current.addRemoteStream(player.id, pendingStream);
+      pendingRemoteStreamsRef.current.delete(player.peerId);
+    }
+  }, [remotePlayers]);
 
   const createSilentStream = useCallback((): MediaStream => {
     if (!dummyAudioCtxRef.current) dummyAudioCtxRef.current = new AudioContext();
@@ -769,30 +987,94 @@ export default function App() {
   }, []);
 
   const getMicStream = useCallback(async (): Promise<MediaStream> => {
+    const preferredConstraints = buildPreferredMicConstraints();
+    const requestedAudioConstraints =
+      selectedInputDeviceId !== 'default'
+        ? ({
+            ...preferredConstraints,
+            deviceId: { ideal: selectedInputDeviceId },
+          } as MediaTrackConstraints)
+        : preferredConstraints;
+
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: buildPreferredMicConstraints() });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: requestedAudioConstraints });
     } catch {
       // Fallback path for browsers that reject advanced constraints.
+      const fallbackConstraints =
+        selectedInputDeviceId !== 'default'
+          ? ({
+              ...MIC_AUDIO_CONSTRAINTS,
+              deviceId: { ideal: selectedInputDeviceId },
+            } as MediaTrackConstraints)
+          : MIC_AUDIO_CONSTRAINTS;
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: MIC_AUDIO_CONSTRAINTS,
+        audio: fallbackConstraints,
       });
     }
 
     const track = stream.getAudioTracks()[0];
     if (track) await tuneMicTrack(track);
+    await refreshAudioDevices().catch(() => {});
 
     return stream;
-  }, []);
+  }, [refreshAudioDevices, selectedInputDeviceId]);
+
+  const registerPeerCallHandlers = useCallback((peer: Peer) => {
+    const handleCall = (call: any) => {
+      const stream = myStreamRef.current;
+      if (stream) call.answer(stream);
+      else call.answer(createSilentStream());
+
+      call.on('stream', (remoteStream: MediaStream) => {
+        attachRemoteStreamByPeerId(call.peer, remoteStream);
+      });
+    };
+
+    peer.on('call', handleCall);
+    return () => { peer.off('call', handleCall); };
+  }, [attachRemoteStreamByPeerId, createSilentStream]);
+
+  const ensureAudioDeviceAccess = useCallback(async () => {
+    await refreshAudioDevices().catch(() => {});
+
+    const hasHiddenLabels = [...audioInputDevices, ...audioOutputDevices].some(device => !device.label);
+    if (!hasHiddenLabels || !navigator.mediaDevices?.getUserMedia) return;
+
+    let probeStream: MediaStream | null = null;
+    try {
+      probeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      return;
+    } finally {
+      await refreshAudioDevices().catch(() => {});
+      probeStream?.getTracks().forEach(track => track.stop());
+    }
+  }, [audioInputDevices, audioOutputDevices, refreshAudioDevices]);
 
   const handleJoin = useCallback(async (name: string) => {
     setUserName(name); const spawn = getRandomSpawn(); setUserPos(spawn);
-    const peer = new Peer(); peerRef.current = peer;
+    if (!myStreamRef.current) {
+      const silentStream = createSilentStream();
+      myStreamRef.current = silentStream;
+      setMyStream(silentStream);
+    }
+    const iceServers = await resolveIceServers();
+    const peer = new Peer(buildPeerOptions(iceServers)); peerRef.current = peer;
+    registerPeerCallHandlers(peer);
     peer.on('open', (id) => {
       const isLocal = window.location.hostname === 'localhost' || window.location.hostname.match(/\d+\.\d+\.\d+\.\d+/);
       const socket = io(isLocal ? `http://${window.location.hostname}:3001` : '/');
       socketRef.current = socket;
-      socket.emit('join', { name, pos: spawn, roomId: null, peerId: id, color: userColor, audioEnabled: false });
+      socket.emit('join', {
+        name,
+        pos: spawn,
+        roomId: null,
+        peerId: id,
+        color: userColor,
+        audioEnabled: false,
+        clientInstanceId: clientInstanceIdRef.current,
+      });
       socket.on('current-players', (players) => { const others = { ...players }; if (socket.id) delete others[socket.id]; setRemotePlayers(others); });
       socket.on('player-joined', p => setRemotePlayers(prev => ({ ...prev, [p.id]: p })));
       socket.on('player-moved', ({ id, pos, roomId }) => setRemotePlayers(prev => prev[id] ? { ...prev, [id]: { ...prev[id], pos, roomId } } : prev));
@@ -813,31 +1095,57 @@ export default function App() {
       
       setJoined(true);
     });
-  }, [createSilentStream, userColor]);
+    peer.on('error', (error) => {
+      console.error('PeerJS connection error', error);
+    });
+  }, [createSilentStream, registerPeerCallHandlers, resolveIceServers, userColor]);
 
-  // FIX: Handle ALL incoming PeerJS calls centrally in App, where we always have
-  // access to the latest stream via the ref. This replaces the broken handler in
-  // OfficeCanvas which received myStream as a stale prop.
   useEffect(() => {
-    const peer = peerRef.current;
-    if (!peer) return;
-    const handleCall = (call: any) => {
-      // Always answer with whatever stream we currently have
-      const stream = myStreamRef.current;
-      if (stream) call.answer(stream);
-      else call.answer(); // answer with no stream if somehow not ready
-      call.on('stream', (remoteStream: MediaStream) => {
-        // Find which socket ID owns this peerId
-        const callerId = Object.keys(remotePlayersRef.current).find(
-          id => remotePlayersRef.current[id].peerId === call.peer
-        );
-        if (callerId) {
-          audioEngineRef.current.addRemoteStream(callerId, remoteStream);
-        }
-      });
+    if (!joined) return;
+
+    const sendLeave = () => {
+      const socket = socketRef.current;
+      if (!socket) return;
+
+      socket.emit('leave');
+      socket.disconnect();
     };
-    peer.on('call', handleCall);
-    return () => { peer.off('call', handleCall); };
+
+    const heartbeatId = window.setInterval(() => {
+      socketRef.current?.emit('presence-ping');
+    }, 5000);
+
+    const clearHiddenLeaveTimeout = () => {
+      if (hiddenLeaveTimeoutRef.current == null) return;
+      window.clearTimeout(hiddenLeaveTimeoutRef.current);
+      hiddenLeaveTimeoutRef.current = null;
+    };
+
+    const scheduleHiddenLeave = () => {
+      clearHiddenLeaveTimeout();
+      hiddenLeaveTimeoutRef.current = window.setTimeout(() => {
+        if (document.visibilityState === 'hidden') sendLeave();
+      }, 8000);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') scheduleHiddenLeave();
+      else clearHiddenLeaveTimeout();
+    };
+
+    const handlePageHide = () => sendLeave();
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('beforeunload', handlePageHide);
+
+    return () => {
+      window.clearInterval(heartbeatId);
+      clearHiddenLeaveTimeout();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('beforeunload', handlePageHide);
+    };
   }, [joined]);
 
   const handleEnableAudio = useCallback(async () => {
@@ -876,6 +1184,62 @@ export default function App() {
     }
   }, [audioMuted, createSilentStream, getMicStream, replaceOutgoingAudioTrack, startSpeechDetection]);
 
+  const handleOutputDeviceChange = useCallback(async (deviceId: string) => {
+    setSelectedOutputDeviceId(deviceId);
+    try {
+      await audioEngineRef.current.setOutputDevice(deviceId);
+    } catch (error) {
+      console.warn('Failed to switch speaker output', error);
+    }
+  }, []);
+
+  const handleInputDeviceChange = useCallback(async (deviceId: string) => {
+    setSelectedInputDeviceId(deviceId);
+
+    if (!audioEnabled || audioMuted) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio:
+          deviceId === 'default'
+            ? buildPreferredMicConstraints()
+            : ({
+                ...buildPreferredMicConstraints(),
+                deviceId: { ideal: deviceId },
+              } as MediaTrackConstraints),
+      }).catch(async () => {
+        return navigator.mediaDevices.getUserMedia({
+          audio:
+            deviceId === 'default'
+              ? MIC_AUDIO_CONSTRAINTS
+              : ({
+                  ...MIC_AUDIO_CONSTRAINTS,
+                  deviceId: { ideal: deviceId },
+                } as MediaTrackConstraints),
+        });
+      });
+
+      const track = stream.getAudioTracks()[0];
+      if (track) await tuneMicTrack(track);
+      myStreamRef.current?.getTracks().forEach((t) => t.stop());
+      myStreamRef.current = stream;
+      setMyStream(stream);
+      replaceOutgoingAudioTrack(track || null);
+      startSpeechDetection(stream);
+      await refreshAudioDevices().catch(() => {});
+    } catch (error) {
+      console.warn('Failed to switch microphone input', error);
+    }
+  }, [audioEnabled, audioMuted, refreshAudioDevices, replaceOutgoingAudioTrack, startSpeechDetection]);
+
+  const handleToggleAudioMenu = useCallback(() => {
+    setAudioMenuOpen((open) => {
+      const nextOpen = !open;
+      if (nextOpen) ensureAudioDeviceAccess().catch(() => {});
+      return nextOpen;
+    });
+  }, [ensureAudioDeviceAccess]);
+
   const handleLeave = () => { window.location.reload(); };
   const handleStateUpdate = useCallback((s: any) => { setUserPos(s.userPos); setUserRoom(s.userRoom); setAudibleUsers(s.audibleUsers); socketRef.current?.emit('move', { pos: s.userPos, roomId: s.userRoom }); }, []);
 
@@ -901,9 +1265,74 @@ export default function App() {
                <OfficeCanvas userName={userName} userColor={userColor} audioEnabled={audioEnabled} audioMuted={audioMuted} hearingRange={hearingRange} micLevel={micLevel} audioEngine={audioEngineRef.current} remotePlayers={remotePlayers} theme={theme} onStateUpdate={handleStateUpdate} myStream={myStream} peer={peerRef.current} />
             </div>
             <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex items-center p-1.5 bg-[var(--color-bg-card)]/90 backdrop-blur-xl rounded-full border border-[var(--color-border)] shadow-2xl z-30">
-              <button onClick={!audioEnabled ? handleEnableAudio : handleToggleMute} className={cn("w-12 h-12 flex shrink-0 items-center justify-center rounded-full transition-all duration-300", !audioEnabled ? "bg-[var(--color-accent)] text-white animate-pulse" : audioMuted ? "bg-red-500 text-white" : "bg-[var(--color-bg-secondary)] hover:bg-[var(--color-border)]")}>
-                {(!audioEnabled || audioMuted) ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-              </button>
+              <div ref={audioMenuRef} className="relative flex items-center">
+                {audioMenuOpen && (
+                  <div className="absolute bottom-full left-0 mb-3 w-80 rounded-3xl border border-[var(--color-border)] bg-[#1b1f23]/96 p-3 text-left shadow-2xl backdrop-blur-xl">
+                    <div className="px-3 pb-2 pt-1 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">Select Microphone</div>
+                    <button
+                      onClick={() => { handleInputDeviceChange('default'); }}
+                      className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
+                    >
+                      <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedInputDeviceId === 'default' ? <Check className="h-4 w-4" /> : null}</div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-white">System Default</div>
+                        <div className="truncate text-xs text-[var(--color-text-muted)]">Default microphone</div>
+                      </div>
+                    </button>
+                    {audioInputDevices.map((device) => (
+                      <button
+                        key={device.deviceId}
+                        onClick={() => { handleInputDeviceChange(device.deviceId); }}
+                        className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
+                      >
+                        <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedInputDeviceId === device.deviceId ? <Check className="h-4 w-4" /> : null}</div>
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-medium text-white">{getDeviceLabel(device, 'Microphone')}</div>
+                        </div>
+                      </button>
+                    ))}
+
+                    <div className="my-2 h-px bg-white/8" />
+                    <div className="px-3 pb-2 pt-1 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">Select Speaker</div>
+                    <button
+                      onClick={() => { handleOutputDeviceChange('default'); }}
+                      className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
+                    >
+                      <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedOutputDeviceId === 'default' ? <Check className="h-4 w-4" /> : null}</div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-white">System Default</div>
+                        <div className="truncate text-xs text-[var(--color-text-muted)]">Default speaker</div>
+                      </div>
+                    </button>
+                    {canSelectOutputDevice ? (
+                      audioOutputDevices.map((device) => (
+                        <button
+                          key={device.deviceId}
+                          onClick={() => { handleOutputDeviceChange(device.deviceId); }}
+                          className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
+                        >
+                          <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedOutputDeviceId === device.deviceId ? <Check className="h-4 w-4" /> : null}</div>
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-medium text-white">{getDeviceLabel(device, 'Speaker')}</div>
+                          </div>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="px-3 py-2 text-sm text-[var(--color-text-muted)]">This browser does not support selecting a speaker output device.</div>
+                    )}
+                  </div>
+                )}
+                <button onClick={!audioEnabled ? handleEnableAudio : handleToggleMute} className={cn("w-12 h-12 flex shrink-0 items-center justify-center rounded-full transition-all duration-300", !audioEnabled ? "bg-[var(--color-accent)] text-white animate-pulse" : audioMuted ? "bg-red-500 text-white" : "bg-[var(--color-bg-secondary)] hover:bg-[var(--color-border)]")}>
+                  {(!audioEnabled || audioMuted) ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                </button>
+                <button
+                  onClick={handleToggleAudioMenu}
+                  className="ml-1 flex h-12 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--color-bg-secondary)] text-[var(--color-text-secondary)] transition hover:bg-[var(--color-border)] hover:text-[var(--color-text-primary)]"
+                  title="Audio devices"
+                >
+                  <ChevronUp className={cn("h-4 w-4 transition-transform", audioMenuOpen ? "rotate-180" : "")} />
+                </button>
+              </div>
               {audioEnabled && (
                 <div className="flex items-center justify-center w-8 ml-1 mr-1">
                   <div className="flex items-end gap-[3px] h-5">
