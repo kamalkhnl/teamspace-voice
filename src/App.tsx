@@ -950,6 +950,16 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
                   playerName: p.name,
                   connectionState: pc.connectionState,
                 });
+
+                if (pc.connectionState === 'failed') {
+                  console.warn('[Voice] Peer connection FAILED for', p.name, '- closing dead call and retrying');
+                  closeCall(peerKey, true);
+                } else if (pc.connectionState === 'closed') {
+                  const activeCall = activeCalls.current.get(peerKey);
+                  if (activeCall?.call === call) {
+                    cleanupCall(peerKey, true);
+                  }
+                }
               };
               pc.onsignalingstatechange = () => {
                 voiceDebug('Peer signaling state changed', {
@@ -1379,6 +1389,13 @@ export default function App() {
               peerId: call.peer,
               connectionState: pc.connectionState,
             });
+
+            if (pc.connectionState === 'failed') {
+              console.warn('[Voice] Incoming peer connection FAILED from', call.peer, '- closing dead call');
+              try {
+                call.close();
+              } catch {}
+            }
           };
           pc.onsignalingstatechange = () => {
             voiceDebug('Incoming signaling state changed', {
