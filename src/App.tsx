@@ -111,6 +111,29 @@ function parseIceServersFromEnv(): RTCIceServer[] {
   return DEFAULT_ICE_SERVERS;
 }
 
+function normalizeIceServers(iceServers: RTCIceServer[]): RTCIceServer[] {
+  const forceTurnTcp = parseBooleanEnv(import.meta.env.VITE_FORCE_TURN_TCP);
+  if (forceTurnTcp === false) return iceServers;
+
+  return iceServers.map((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    const hasTurnUrl = urls.some((url) => url.startsWith('turn:') || url.startsWith('turns:'));
+    if (!hasTurnUrl) return server;
+
+    const tcpTurnUrls = urls.filter((url) => {
+      if (!(url.startsWith('turn:') || url.startsWith('turns:'))) return false;
+      return /transport=tcp/i.test(url);
+    });
+
+    if (tcpTurnUrls.length === 0) return server;
+
+    return {
+      ...server,
+      urls: tcpTurnUrls,
+    };
+  });
+}
+
 async function resolveIceServers(): Promise<RTCIceServer[]> {
   try {
     const res = await fetch('/api/ice-servers', { cache: 'no-store' });
@@ -120,14 +143,15 @@ async function resolveIceServers(): Promise<RTCIceServer[]> {
 
     const data = await res.json();
     if (Array.isArray(data?.iceServers) && data.iceServers.length > 0) {
-      console.log('[Voice] ICE servers from /api/ice-servers:', JSON.stringify(data.iceServers.map((s: any) => s.urls)));
-      return data.iceServers;
+      const normalized = normalizeIceServers(data.iceServers);
+      console.log('[Voice] ICE servers from /api/ice-servers:', JSON.stringify(normalized.map((s: any) => s.urls)));
+      return normalized;
     }
 
     throw new Error('ICE server endpoint returned no iceServers');
   } catch (error) {
     console.warn('[Voice] Falling back to static ICE server configuration.', error);
-    return parseIceServersFromEnv();
+    return normalizeIceServers(parseIceServersFromEnv());
   }
 }
 
