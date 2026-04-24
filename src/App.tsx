@@ -367,10 +367,17 @@ class SpatialAudioEngine {
   }> = new Map();
 
   async init(): Promise<void> {
-    if (this.ctx) return;
-    this.ctx = new AudioContext();
-    this.masterGain = this.ctx.createGain();
-    this.masterGain.connect(this.ctx.destination);
+    if (this.ctx && this.ctx.state !== 'closed') return;
+    
+    try {
+      this.ctx = new AudioContext();
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.connect(this.ctx.destination);
+      console.log('[AudioEngine] Initialized AudioContext:', this.ctx.state);
+    } catch (e) {
+      console.error('[AudioEngine] Failed to initialize AudioContext:', e);
+      return;
+    }
     // Standardize listener orientation
     if (this.ctx.listener.forwardX) {
       this.ctx.listener.forwardX.setValueAtTime(0, this.ctx.currentTime);
@@ -1040,9 +1047,15 @@ export default function App() {
     document.documentElement.classList.toggle('light', theme === 'light');
   }, [theme]);
 
-  const startSpeechDetection = useCallback((stream: MediaStream) => {
-    if (audioCtxRef.current) audioCtxRef.current.close();
-    const ctx = new AudioContext(); audioCtxRef.current = ctx;
+  const startSpeechDetection = useCallback(async (stream: MediaStream) => {
+    try {
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        await audioCtxRef.current.close().catch(() => {});
+      }
+    } catch (_) {}
+
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
     const src = ctx.createMediaStreamSource(stream);
     const analyzer = ctx.createAnalyser(); src.connect(analyzer);
     const data = new Uint8Array(analyzer.frequencyBinCount);
@@ -1103,7 +1116,11 @@ export default function App() {
         attachRemoteStreamByPeerId(call.peer, remoteStream);
       });
       call.on('error', (err: any) => console.warn('[Voice] Incoming call error from', call.peer, err));
-      call.on('close', () => console.log('[Voice] Incoming call closed from', call.peer));
+      call.on('close', () => {
+        console.log('[Voice] Incoming call closed from', call.peer);
+        const callerId = Object.keys(remotePlayersRef.current).find(id => remotePlayersRef.current[id].peerId === call.peer);
+        if (callerId) audioEngineRef.current.removeUser(callerId);
+      });
     };
 
     peer.on('call', handleCall);
