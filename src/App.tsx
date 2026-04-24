@@ -408,12 +408,14 @@ class SpatialAudioEngine {
   private masterGain: GainNode | null = null;
   private outputDeviceId = 'default';
   private wasAudibleByUser = new Map<string, boolean>();
+  private directAudioFallback = parseBooleanEnv(import.meta.env.VITE_DIRECT_AUDIO_FALLBACK) !== false;
   private userNodes: Map<string, { 
     source: MediaElementAudioSourceNode; 
     gain: GainNode; 
     panner: PannerNode; 
     stream: MediaStream;
     audioEl: HTMLAudioElement; 
+    directAudioEl: HTMLAudioElement | null;
   }> = new Map();
 
   async init(): Promise<void> {
@@ -448,10 +450,13 @@ class SpatialAudioEngine {
     this.outputDeviceId = deviceId;
 
     await Promise.all(
-      Array.from(this.userNodes.values()).map(({ audioEl }) => {
+      Array.from(this.userNodes.values()).flatMap(({ audioEl, directAudioEl }) => {
         const sinkTarget = deviceId === 'default' ? '' : deviceId;
-        const sinkSetter = (audioEl as HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> }).setSinkId;
-        return sinkSetter ? sinkSetter.call(audioEl, sinkTarget) : Promise.resolve();
+        const targets = [audioEl, directAudioEl].filter(Boolean) as HTMLAudioElement[];
+        return targets.map((target) => {
+          const sinkSetter = (target as HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> }).setSinkId;
+          return sinkSetter ? sinkSetter.call(target, sinkTarget) : Promise.resolve();
+        });
       })
     );
   }
@@ -514,6 +519,7 @@ class SpatialAudioEngine {
     const source = this.ctx.createMediaElementSource(audioEl);
     const gain = this.ctx.createGain();
     const panner = this.ctx.createPanner();
+    let directAudioEl: HTMLAudioElement | null = null;
     
     gain.gain.value = 0;
     panner.panningModel = 'HRTF';
@@ -533,8 +539,31 @@ class SpatialAudioEngine {
       .catch(e => {
         console.warn("Autoplay blocked for remote audio", e);
       });
+
+    if (this.directAudioFallback) {
+      directAudioEl = new Audio();
+      directAudioEl.srcObject = stream;
+      directAudioEl.autoplay = true;
+      directAudioEl.playsInline = true;
+      directAudioEl.disableRemotePlayback = true;
+      directAudioEl.muted = false;
+      directAudioEl.volume = 0;
+      const directSinkSetter = (directAudioEl as HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> }).setSinkId;
+      if (directSinkSetter) {
+        const sinkTarget = this.outputDeviceId === 'default' ? '' : this.outputDeviceId;
+        directSinkSetter.call(directAudioEl, sinkTarget).catch((e) => console.warn('Failed to set direct fallback output device', e));
+      }
+
+      directAudioEl.play()
+        .then(() => {
+          voiceDebug('Direct audio fallback play() resolved', { userId: id, readyState: directAudioEl?.readyState });
+        })
+        .catch((e) => {
+          console.warn('Direct audio fallback play blocked', e);
+        });
+    }
     
-    this.userNodes.set(id, { source, gain, panner, stream, audioEl });
+    this.userNodes.set(id, { source, gain, panner, stream, audioEl, directAudioEl });
   }
 
   updateUser(userId: string, listenerPos: Position, sourcePos: Position, canHear: boolean, volume: number): void {
@@ -560,6 +589,10 @@ class SpatialAudioEngine {
       });
       this.wasAudibleByUser.set(userId, isAudible);
     }
+    if (nodes.directAudioEl) {
+      const clamped = Math.max(0, Math.min(1, targetGain));
+      nodes.directAudioEl.volume = clamped;
+    }
     nodes.gain.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.15);
   }
 
@@ -577,6 +610,8 @@ class SpatialAudioEngine {
         nodes.panner.disconnect(); 
         nodes.audioEl.pause();
         nodes.audioEl.srcObject = null;
+        nodes.directAudioEl?.pause();
+        if (nodes.directAudioEl) nodes.directAudioEl.srcObject = null;
       } catch (e) {}
       this.userNodes.delete(id);
       this.wasAudibleByUser.delete(id);
