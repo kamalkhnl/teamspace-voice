@@ -69,7 +69,6 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 ];
 const CALL_CONNECT_TIMEOUT_MS = 8000;
 const CALL_RETRY_COOLDOWN_MS = 4000;
-const ICE_DISCONNECT_GRACE_MS = 7000;
 const PROXIMITY_DISCONNECT_GRACE_MS = 5000;
 
 function getClientInstanceId(): string {
@@ -178,8 +177,10 @@ async function testTurnConnectivity(iceServers: RTCIceServer[]): Promise<boolean
 }
 
 function buildPeerOptions(iceServers: RTCIceServer[]) {
+  const forceRelay = parseBooleanEnv(import.meta.env.VITE_FORCE_RELAY);
+  const iceTransportPolicy: RTCIceTransportPolicy = forceRelay === false ? 'all' : 'relay';
   const options: Record<string, unknown> = {
-    config: { iceServers },
+    config: { iceServers, iceTransportPolicy },
     debug: 1,
   };
 
@@ -807,19 +808,7 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
                   console.error('[Voice] ICE FAILED for', p.name, '— TURN server may be unreachable');
                   closeCall(peerKey, true);
                 } else if (pc.iceConnectionState === 'disconnected') {
-                  const activeCall = activeCalls.current.get(peerKey);
-                  if (!activeCall || activeCall.disconnectTimeoutId != null) return;
-                  activeCall.disconnectTimeoutId = window.setTimeout(() => {
-                    const latest = activeCalls.current.get(peerKey);
-                    if (!latest) return;
-                    const latestPc = latest.call.peerConnection as RTCPeerConnection | undefined;
-                    if (!latestPc || latestPc.iceConnectionState === 'connected' || latestPc.iceConnectionState === 'completed') {
-                      latest.disconnectTimeoutId = null;
-                      return;
-                    }
-                    console.warn('[Voice] ICE stayed disconnected for', p.name, '- reconnecting');
-                    closeCall(peerKey, true);
-                  }, ICE_DISCONNECT_GRACE_MS);
+                  console.warn('[Voice] ICE disconnected for', p.name, '- waiting for recovery (no forced reconnect)');
                 } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
                   const activeCall = activeCalls.current.get(peerKey);
                   if (!activeCall || activeCall.disconnectTimeoutId == null) return;
