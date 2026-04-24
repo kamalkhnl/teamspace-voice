@@ -94,6 +94,26 @@ function parseBooleanEnv(value: string | undefined): boolean | undefined {
   return undefined;
 }
 
+const VOICE_DEBUG = parseBooleanEnv(import.meta.env.VITE_VOICE_DEBUG) !== false;
+
+function voiceDebug(message: string, details?: Record<string, unknown>): void {
+  if (!VOICE_DEBUG) return;
+  if (details) console.log('[Voice:DBG]', message, details);
+  else console.log('[Voice:DBG]', message);
+}
+
+function describeAudioTrack(track: MediaStreamTrack | undefined): Record<string, unknown> {
+  if (!track) return { exists: false };
+  return {
+    id: track.id,
+    kind: track.kind,
+    enabled: track.enabled,
+    muted: track.muted,
+    readyState: track.readyState,
+    label: track.label,
+  };
+}
+
 function parseIceServersFromEnv(): RTCIceServer[] {
   const rawIceServers = import.meta.env.VITE_PEER_ICE_SERVERS?.trim();
   if (!rawIceServers) return DEFAULT_ICE_SERVERS;
@@ -386,6 +406,7 @@ class SpatialAudioEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
   private outputDeviceId = 'default';
+  private wasAudibleByUser = new Map<string, boolean>();
   private userNodes: Map<string, { 
     source: MediaElementAudioSourceNode; 
     gain: GainNode; 
@@ -437,6 +458,14 @@ class SpatialAudioEngine {
   addRemoteStream(id: string, stream: MediaStream): void {
     if (!this.ctx || !this.masterGain) return;
     this.removeUser(id);
+
+    voiceDebug('Adding remote stream to audio engine', {
+      userId: id,
+      ctxState: this.ctx.state,
+      outputDeviceId: this.outputDeviceId,
+      trackCount: stream.getTracks().length,
+      audioTracks: stream.getAudioTracks().map(track => describeAudioTrack(track)),
+    });
     
     // Route the remote stream through a media element first so the browser can
     // treat it like normal playback while we still keep spatial positioning.
@@ -452,6 +481,31 @@ class SpatialAudioEngine {
       const sinkTarget = this.outputDeviceId === 'default' ? '' : this.outputDeviceId;
       sinkSetter.call(audioEl, sinkTarget).catch((e) => console.warn('Failed to set audio output device', e));
     }
+
+    audioEl.addEventListener('playing', () => {
+      voiceDebug('Remote audio element playing', {
+        userId: id,
+        paused: audioEl.paused,
+        readyState: audioEl.readyState,
+        currentTime: Number(audioEl.currentTime.toFixed(2)),
+      });
+    });
+    audioEl.addEventListener('waiting', () => {
+      voiceDebug('Remote audio element waiting for data', { userId: id, readyState: audioEl.readyState });
+    });
+    audioEl.addEventListener('stalled', () => {
+      voiceDebug('Remote audio element stalled', { userId: id, readyState: audioEl.readyState });
+    });
+    audioEl.addEventListener('pause', () => {
+      voiceDebug('Remote audio element paused', { userId: id, readyState: audioEl.readyState });
+    });
+    audioEl.addEventListener('error', () => {
+      voiceDebug('Remote audio element error', {
+        userId: id,
+        mediaErrorCode: audioEl.error?.code,
+        mediaErrorMessage: audioEl.error?.message,
+      });
+    });
     
     // Ensure context is running when a new stream arrives
     if (this.ctx.state === 'suspended') this.ctx.resume();
@@ -471,7 +525,13 @@ class SpatialAudioEngine {
     gain.connect(panner);
     panner.connect(this.masterGain);
 
-    audioEl.play().catch(e => console.warn("Autoplay blocked for remote audio", e));
+    audioEl.play()
+      .then(() => {
+        voiceDebug('Remote audio play() resolved', { userId: id, readyState: audioEl.readyState });
+      })
+      .catch(e => {
+        console.warn("Autoplay blocked for remote audio", e);
+      });
     
     this.userNodes.set(id, { source, gain, panner, stream, audioEl });
   }
@@ -486,6 +546,19 @@ class SpatialAudioEngine {
     nodes.panner.positionY.setTargetAtTime(0, this.ctx.currentTime, 0.1);
     // volume is already 0 when out of range; canHear controls smooth on/off
     const targetGain = canHear ? volume : 0;
+    const isAudible = targetGain > 0.02;
+    const wasAudible = this.wasAudibleByUser.get(userId) ?? false;
+    if (isAudible !== wasAudible) {
+      voiceDebug('Remote user audibility changed', {
+        userId,
+        isAudible,
+        canHear,
+        targetGain: Number(targetGain.toFixed(3)),
+        listenerPos,
+        sourcePos,
+      });
+      this.wasAudibleByUser.set(userId, isAudible);
+    }
     nodes.gain.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.15);
   }
 
@@ -496,6 +569,7 @@ class SpatialAudioEngine {
   removeUser(id: string): void {
     const nodes = this.userNodes.get(id);
     if (nodes) {
+      voiceDebug('Removing remote user from audio engine', { userId: id });
       try { 
         nodes.source.disconnect(); 
         nodes.gain.disconnect(); 
@@ -504,13 +578,16 @@ class SpatialAudioEngine {
         nodes.audioEl.srcObject = null;
       } catch (e) {}
       this.userNodes.delete(id);
+      this.wasAudibleByUser.delete(id);
     }
   }
 
   destroy(): void {
+    voiceDebug('Destroying audio engine', { activeUsers: this.userNodes.size });
     this.userNodes.forEach((_, id) => this.removeUser(id));
     if (this.ctx) { this.ctx.close(); this.ctx = null; }
     this.masterGain = null;
+    this.wasAudibleByUser.clear();
   }
 }
 
@@ -668,6 +745,7 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
   const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean; timeoutId: number | null; disconnectTimeoutId: number | null; playerId: string }>>(new Map());
   const retryAfterByPeerId = useRef<Map<string, number>>(new Map());
   const disconnectAfterByPeerId = useRef<Map<string, number>>(new Map());
+  const lastDecisionByPeerId = useRef<Map<string, string>>(new Map());
   
   // REFS for stability in the physics/render loop
   const remotePlayersRef = useRef(remotePlayers);
@@ -801,6 +879,22 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
         isConnected &&
         Boolean(myZone || otherZone);
 
+      const decisionKey = `${shouldBeConnected ? 'connect' : 'disconnect'}:${isConnected ? 'connected' : 'idle'}:${sharingRoom ? 'room' : 'no-room'}:${sharingOpenFloor ? 'floor' : 'no-floor'}`;
+      if (lastDecisionByPeerId.current.get(peerKey) !== decisionKey) {
+        lastDecisionByPeerId.current.set(peerKey, decisionKey);
+        voiceDebug('Proximity call decision changed', {
+          peerId: peerKey,
+          playerId: p.id,
+          playerName: p.name,
+          distance: Math.round(d),
+          myZone,
+          otherZone,
+          shouldBeConnected,
+          isConnected,
+          crossedRoomBoundary,
+        });
+      }
+
       if (shouldBeConnected) {
         disconnectAfterByPeerId.current.delete(peerKey);
       }
@@ -813,6 +907,12 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
           console.log('[Voice] Initiating call to', p.peerId, '(player', p.id, p.name, ')');
           const call = peer.call(p.peerId, myStreamRef.current!);
           if (!call) { console.warn('[Voice] peer.call returned null for', p.peerId); return; }
+          voiceDebug('Outgoing call created', {
+            peerId: p.peerId,
+            playerId: p.id,
+            playerName: p.name,
+            localAudioTrack: describeAudioTrack(myStreamRef.current?.getAudioTracks()[0]),
+          });
           const timeoutId = window.setTimeout(() => {
             const activeCall = activeCalls.current.get(peerKey);
             if (!activeCall || activeCall.streamAdded) return;
@@ -826,6 +926,10 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
           try {
             const pc = call.peerConnection as RTCPeerConnection | undefined;
             if (pc) {
+              voiceDebug('Outgoing RTCPeerConnection created', {
+                peerId: p.peerId,
+                iceTransportPolicy: pc.getConfiguration()?.iceTransportPolicy,
+              });
               pc.oniceconnectionstatechange = () => {
                 console.log('[Voice] ICE state for', p.name, ':', pc.iceConnectionState);
                 if (pc.iceConnectionState === 'failed') {
@@ -840,6 +944,27 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
                   activeCall.disconnectTimeoutId = null;
                 }
               };
+              pc.onconnectionstatechange = () => {
+                voiceDebug('Peer connection state changed', {
+                  peerId: p.peerId,
+                  playerName: p.name,
+                  connectionState: pc.connectionState,
+                });
+              };
+              pc.onsignalingstatechange = () => {
+                voiceDebug('Peer signaling state changed', {
+                  peerId: p.peerId,
+                  playerName: p.name,
+                  signalingState: pc.signalingState,
+                });
+              };
+              pc.onicegatheringstatechange = () => {
+                voiceDebug('ICE gathering state changed', {
+                  peerId: p.peerId,
+                  playerName: p.name,
+                  iceGatheringState: pc.iceGatheringState,
+                });
+              };
               pc.onicecandidate = (e) => {
                 if (e.candidate) {
                   console.log('[Voice] ICE candidate:', e.candidate.type, e.candidate.protocol, e.candidate.address);
@@ -850,6 +975,11 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
 
           call.on('stream', (s: MediaStream) => { 
             console.log('[Voice] Got stream from', p.peerId, '(player', p.id, ') — tracks:', s.getTracks().length);
+            voiceDebug('Outgoing call received remote stream', {
+              peerId: p.peerId,
+              playerId: p.id,
+              audioTracks: s.getAudioTracks().map(track => describeAudioTrack(track)),
+            });
             audioEngine?.addRemoteStream(p.id, s); 
             if (activeCalls.current.has(peerKey)) {
               const activeCall = activeCalls.current.get(peerKey)!;
@@ -883,6 +1013,7 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
     for (const peerKey of disconnectAfterByPeerId.current.keys()) {
       const stillPresent = Object.values(remotePlayersRef.current || {}).some(p => p?.peerId === peerKey);
       if (!stillPresent) disconnectAfterByPeerId.current.delete(peerKey);
+      if (!stillPresent) lastDecisionByPeerId.current.delete(peerKey);
     }
   }
 
@@ -1123,13 +1254,20 @@ export default function App() {
   }, []);
 
   const replaceOutgoingAudioTrack = useCallback((track: MediaStreamTrack | null) => {
+    let replacedSenders = 0;
     Object.values(peerRef.current?.connections || {}).forEach((conns: any) => {
       conns.forEach((c: any) => {
-        c.peerConnection
+        const sender = c.peerConnection
           ?.getSenders()
           .find((s: any) => s.track?.kind === 'audio')
-          ?.replaceTrack(track);
+        if (!sender) return;
+        replacedSenders++;
+        sender.replaceTrack(track);
       });
+    });
+    voiceDebug('Replaced outgoing audio track on active senders', {
+      replacedSenders,
+      track: describeAudioTrack(track ?? undefined),
     });
   }, []);
 
@@ -1159,6 +1297,10 @@ export default function App() {
   }, []);
 
   const getMicStream = useCallback(async (): Promise<MediaStream> => {
+    voiceDebug('Requesting microphone stream', {
+      selectedInputDeviceId,
+      noiseReduction,
+    });
     const preferredConstraints = buildPreferredMicConstraints();
     const withNR = { ...preferredConstraints, noiseSuppression: noiseReduction };
     const requestedAudioConstraints =
@@ -1189,6 +1331,10 @@ export default function App() {
 
     const track = stream.getAudioTracks()[0];
     if (track) await tuneMicTrack(track);
+    voiceDebug('Microphone stream ready', {
+      track: describeAudioTrack(track),
+      trackCount: stream.getTracks().length,
+    });
     await refreshAudioDevices().catch(() => {});
 
     return stream;
@@ -1217,11 +1363,50 @@ export default function App() {
 
       const stream = myStreamRef.current;
       console.log('[Voice] Incoming call from', call.peer, '— answering with', stream ? 'live stream' : 'silent stream');
+      voiceDebug('Incoming call answer payload', {
+        peerId: call.peer,
+        usingLiveStream: Boolean(stream),
+        localTrack: describeAudioTrack(stream?.getAudioTracks()[0]),
+      });
       if (stream) call.answer(stream);
       else call.answer(createSilentStream());
 
+      try {
+        const pc = call.peerConnection as RTCPeerConnection | undefined;
+        if (pc) {
+          pc.onconnectionstatechange = () => {
+            voiceDebug('Incoming peer connection state changed', {
+              peerId: call.peer,
+              connectionState: pc.connectionState,
+            });
+          };
+          pc.onsignalingstatechange = () => {
+            voiceDebug('Incoming signaling state changed', {
+              peerId: call.peer,
+              signalingState: pc.signalingState,
+            });
+          };
+          pc.onicegatheringstatechange = () => {
+            voiceDebug('Incoming ICE gathering state changed', {
+              peerId: call.peer,
+              iceGatheringState: pc.iceGatheringState,
+            });
+          };
+          pc.oniceconnectionstatechange = () => {
+            voiceDebug('Incoming ICE state changed', {
+              peerId: call.peer,
+              iceConnectionState: pc.iceConnectionState,
+            });
+          };
+        }
+      } catch {}
+
       call.on('stream', (remoteStream: MediaStream) => {
         console.log('[Voice] Received remote stream from', call.peer, '— tracks:', remoteStream.getTracks().length);
+        voiceDebug('Incoming call delivered remote stream', {
+          peerId: call.peer,
+          audioTracks: remoteStream.getAudioTracks().map(track => describeAudioTrack(track)),
+        });
         attachRemoteStreamByPeerId(call.peer, remoteStream);
       });
       call.on('error', (err: any) => {
