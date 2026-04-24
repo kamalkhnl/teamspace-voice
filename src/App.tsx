@@ -70,6 +70,7 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 const CALL_CONNECT_TIMEOUT_MS = 8000;
 const CALL_RETRY_COOLDOWN_MS = 4000;
 const ICE_DISCONNECT_GRACE_MS = 7000;
+const PROXIMITY_DISCONNECT_GRACE_MS = 5000;
 
 function getClientInstanceId(): string {
   if (typeof window === 'undefined') return Math.random().toString(36).slice(2);
@@ -641,6 +642,7 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
   const accumulatorRef = useRef(0);
   const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean; timeoutId: number | null; disconnectTimeoutId: number | null; playerId: string }>>(new Map());
   const retryAfterByPeerId = useRef<Map<string, number>>(new Map());
+  const disconnectAfterByPeerId = useRef<Map<string, number>>(new Map());
   
   // REFS for stability in the physics/render loop
   const remotePlayersRef = useRef(remotePlayers);
@@ -773,6 +775,10 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
         !sharingOpenFloor &&
         isConnected &&
         Boolean(myZone || otherZone);
+
+      if (shouldBeConnected) {
+        disconnectAfterByPeerId.current.delete(peerKey);
+      }
       
       if (shouldBeConnected && !isConnected) {
         const retryAfter = retryAfterByPeerId.current.get(peerKey) ?? 0;
@@ -840,6 +846,8 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
             }
           });
           call.on('close', () => {
+            const iceState = (call.peerConnection as RTCPeerConnection | undefined)?.iceConnectionState;
+            console.log('[Voice] Outgoing call closed for', p.name, '- ICE state at close:', iceState ?? 'unknown');
             cleanupCall(peerKey, true);
           });
           call.on('error', (e: any) => {
@@ -848,9 +856,21 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
           });
         }
       } else if (crossedRoomBoundary || (!shouldBeConnected && isConnected && d > 450)) {
-        closeCall(peerKey, false);
+        const disconnectAfter = disconnectAfterByPeerId.current.get(peerKey) ?? (Date.now() + PROXIMITY_DISCONNECT_GRACE_MS);
+        disconnectAfterByPeerId.current.set(peerKey, disconnectAfter);
+
+        if (disconnectAfter <= Date.now()) {
+          console.log('[Voice] Closing call for', p.name, 'after sustained out-of-range state');
+          disconnectAfterByPeerId.current.delete(peerKey);
+          closeCall(peerKey, false);
+        }
       }
     });
+
+    for (const peerKey of disconnectAfterByPeerId.current.keys()) {
+      const stillPresent = Object.values(remotePlayersRef.current || {}).some(p => p?.peerId === peerKey);
+      if (!stillPresent) disconnectAfterByPeerId.current.delete(peerKey);
+    }
   }
 
   function tickAudio() {
@@ -1165,6 +1185,16 @@ export default function App() {
     const handleCall = (call: any) => {
       const existingIncomingCall = incomingCallsRef.current.get(call.peer);
       if (existingIncomingCall && existingIncomingCall !== call) {
+        const existingPc = existingIncomingCall.peerConnection as RTCPeerConnection | undefined;
+        const existingState = existingPc?.iceConnectionState;
+        if (existingState === 'connected' || existingState === 'completed' || existingState === 'checking') {
+          console.warn('[Voice] Duplicate incoming call from', call.peer, '- keeping existing call in state', existingState);
+          try {
+            call.close();
+          } catch {}
+          return;
+        }
+
         try {
           existingIncomingCall.close();
         } catch {}
@@ -1187,7 +1217,8 @@ export default function App() {
       });
       call.on('close', () => {
         if (incomingCallsRef.current.get(call.peer) === call) incomingCallsRef.current.delete(call.peer);
-        console.log('[Voice] Incoming call closed from', call.peer);
+        const iceState = (call.peerConnection as RTCPeerConnection | undefined)?.iceConnectionState;
+        console.log('[Voice] Incoming call closed from', call.peer, '- ICE state at close:', iceState ?? 'unknown');
         const callerId = Object.keys(remotePlayersRef.current).find(id => remotePlayersRef.current[id].peerId === call.peer);
         if (callerId) audioEngineRef.current.removeUser(callerId);
       });
