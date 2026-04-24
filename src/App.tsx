@@ -70,6 +70,7 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 const CALL_CONNECT_TIMEOUT_MS = 8000;
 const CALL_RETRY_COOLDOWN_MS = 4000;
 const PROXIMITY_DISCONNECT_GRACE_MS = 5000;
+const CALL_STATS_LOG_INTERVAL_MS = 5000;
 
 function getClientInstanceId(): string {
   if (typeof window === 'undefined') return Math.random().toString(36).slice(2);
@@ -742,10 +743,11 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
   const syncTick = useRef(0);
   const lastTimeRef = useRef(performance.now());
   const accumulatorRef = useRef(0);
-  const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean; timeoutId: number | null; disconnectTimeoutId: number | null; playerId: string }>>(new Map());
+  const activeCalls = useRef<Map<string, { call: any; streamAdded: boolean; timeoutId: number | null; disconnectTimeoutId: number | null; statsIntervalId: number | null; playerId: string }>>(new Map());
   const retryAfterByPeerId = useRef<Map<string, number>>(new Map());
   const disconnectAfterByPeerId = useRef<Map<string, number>>(new Map());
   const lastDecisionByPeerId = useRef<Map<string, string>>(new Map());
+  const incomingStatsIntervalByPeerId = useRef<Map<string, number>>(new Map());
   
   // REFS for stability in the physics/render loop
   const remotePlayersRef = useRef(remotePlayers);
@@ -823,7 +825,102 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
   function manageProximityCalls() {
     if (!peer || !myStreamRef.current) return;
 
-    const clearCallTimers = (entry: { timeoutId: number | null; disconnectTimeoutId: number | null }) => {
+    const logPeerConnectionStats = async (
+      pc: RTCPeerConnection,
+      direction: 'outgoing' | 'incoming',
+      peerId: string,
+      playerName: string
+    ) => {
+      try {
+        const stats = await pc.getStats();
+        let inboundAudio: Record<string, unknown> | null = null;
+        let outboundAudio: Record<string, unknown> | null = null;
+        let selectedPair: Record<string, unknown> | null = null;
+        const localCandidates = new Map<string, RTCStats>();
+        const remoteCandidates = new Map<string, RTCStats>();
+
+        stats.forEach((report) => {
+          if (report.type === 'local-candidate') localCandidates.set(report.id, report);
+          if (report.type === 'remote-candidate') remoteCandidates.set(report.id, report);
+
+          if (report.type === 'inbound-rtp' && (report as any).kind === 'audio' && !(report as any).isRemote) {
+            inboundAudio = {
+              bytesReceived: (report as any).bytesReceived,
+              packetsReceived: (report as any).packetsReceived,
+              packetsLost: (report as any).packetsLost,
+              jitter: (report as any).jitter,
+              audioLevel: (report as any).audioLevel,
+            };
+          }
+
+          if (report.type === 'outbound-rtp' && (report as any).kind === 'audio' && !(report as any).isRemote) {
+            outboundAudio = {
+              bytesSent: (report as any).bytesSent,
+              packetsSent: (report as any).packetsSent,
+              retransmittedPacketsSent: (report as any).retransmittedPacketsSent,
+              qualityLimitationReason: (report as any).qualityLimitationReason,
+            };
+          }
+
+          if (report.type === 'transport') {
+            const pairId = (report as any).selectedCandidatePairId as string | undefined;
+            if (!pairId) return;
+            const pair = stats.get(pairId);
+            if (!pair) return;
+            const local = localCandidates.get((pair as any).localCandidateId);
+            const remote = remoteCandidates.get((pair as any).remoteCandidateId);
+            selectedPair = {
+              state: (pair as any).state,
+              localType: (local as any)?.candidateType,
+              localProtocol: (local as any)?.protocol,
+              remoteType: (remote as any)?.candidateType,
+              remoteProtocol: (remote as any)?.protocol,
+              currentRoundTripTime: (pair as any).currentRoundTripTime,
+            };
+          }
+        });
+
+        voiceDebug('Peer connection RTP stats', {
+          direction,
+          peerId,
+          playerName,
+          connectionState: pc.connectionState,
+          iceConnectionState: pc.iceConnectionState,
+          inboundAudio,
+          outboundAudio,
+          selectedPair,
+        });
+      } catch (error) {
+        voiceDebug('Failed to read peer connection stats', {
+          direction,
+          peerId,
+          playerName,
+          error: String(error),
+        });
+      }
+    };
+
+    const startOutgoingStatsLogger = (peerId: string, playerName: string, call: any) => {
+      const pc = call.peerConnection as RTCPeerConnection | undefined;
+      if (!pc) return;
+
+      const existing = activeCalls.current.get(peerId);
+      if (existing?.statsIntervalId != null) {
+        window.clearInterval(existing.statsIntervalId);
+      }
+
+      const intervalId = window.setInterval(() => {
+        const latest = activeCalls.current.get(peerId);
+        if (!latest || latest.call !== call) return;
+        logPeerConnectionStats(pc, 'outgoing', peerId, playerName);
+      }, CALL_STATS_LOG_INTERVAL_MS);
+
+      if (existing) {
+        existing.statsIntervalId = intervalId;
+      }
+    };
+
+    const clearCallTimers = (entry: { timeoutId: number | null; disconnectTimeoutId: number | null; statsIntervalId: number | null }) => {
       if (entry.timeoutId != null) {
         window.clearTimeout(entry.timeoutId);
         entry.timeoutId = null;
@@ -831,6 +928,10 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
       if (entry.disconnectTimeoutId != null) {
         window.clearTimeout(entry.disconnectTimeoutId);
         entry.disconnectTimeoutId = null;
+      }
+      if (entry.statsIntervalId != null) {
+        window.clearInterval(entry.statsIntervalId);
+        entry.statsIntervalId = null;
       }
     };
 
@@ -920,7 +1021,8 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
             closeCall(peerKey, true);
           }, CALL_CONNECT_TIMEOUT_MS);
 
-          activeCalls.current.set(peerKey, { call, streamAdded: false, timeoutId, disconnectTimeoutId: null, playerId: p.id });
+          activeCalls.current.set(peerKey, { call, streamAdded: false, timeoutId, disconnectTimeoutId: null, statsIntervalId: null, playerId: p.id });
+          startOutgoingStatsLogger(peerKey, p.name, call);
 
           // Monitor ICE connection state to diagnose TURN / connectivity issues
           try {
@@ -1351,6 +1453,66 @@ export default function App() {
   }, [refreshAudioDevices, selectedInputDeviceId, noiseReduction]);
 
   const registerPeerCallHandlers = useCallback((peer: Peer) => {
+    const logPeerConnectionStats = async (
+      pc: RTCPeerConnection,
+      peerId: string
+    ) => {
+      try {
+        const stats = await pc.getStats();
+        let inboundAudio: Record<string, unknown> | null = null;
+        let outboundAudio: Record<string, unknown> | null = null;
+
+        stats.forEach((report) => {
+          if (report.type === 'inbound-rtp' && (report as any).kind === 'audio' && !(report as any).isRemote) {
+            inboundAudio = {
+              bytesReceived: (report as any).bytesReceived,
+              packetsReceived: (report as any).packetsReceived,
+              packetsLost: (report as any).packetsLost,
+              jitter: (report as any).jitter,
+            };
+          }
+          if (report.type === 'outbound-rtp' && (report as any).kind === 'audio' && !(report as any).isRemote) {
+            outboundAudio = {
+              bytesSent: (report as any).bytesSent,
+              packetsSent: (report as any).packetsSent,
+            };
+          }
+        });
+
+        voiceDebug('Incoming peer RTP stats', {
+          peerId,
+          connectionState: pc.connectionState,
+          iceConnectionState: pc.iceConnectionState,
+          inboundAudio,
+          outboundAudio,
+        });
+      } catch (error) {
+        voiceDebug('Failed reading incoming peer stats', { peerId, error: String(error) });
+      }
+    };
+
+    const startIncomingStatsLogger = (peerId: string, call: any) => {
+      const pc = call.peerConnection as RTCPeerConnection | undefined;
+      if (!pc) return;
+
+      const existing = incomingStatsIntervalByPeerId.current.get(peerId);
+      if (existing != null) window.clearInterval(existing);
+
+      const intervalId = window.setInterval(() => {
+        const currentCall = incomingCallsRef.current.get(peerId);
+        if (!currentCall || currentCall !== call) return;
+        logPeerConnectionStats(pc, peerId);
+      }, CALL_STATS_LOG_INTERVAL_MS);
+
+      incomingStatsIntervalByPeerId.current.set(peerId, intervalId);
+    };
+
+    const clearIncomingStatsLogger = (peerId: string) => {
+      const intervalId = incomingStatsIntervalByPeerId.current.get(peerId);
+      if (intervalId != null) window.clearInterval(intervalId);
+      incomingStatsIntervalByPeerId.current.delete(peerId);
+    };
+
     const handleCall = (call: any) => {
       const existingIncomingCall = incomingCallsRef.current.get(call.peer);
       if (existingIncomingCall && existingIncomingCall !== call) {
@@ -1370,6 +1532,7 @@ export default function App() {
       }
 
       incomingCallsRef.current.set(call.peer, call);
+      startIncomingStatsLogger(call.peer, call);
 
       const stream = myStreamRef.current;
       console.log('[Voice] Incoming call from', call.peer, '— answering with', stream ? 'live stream' : 'silent stream');
@@ -1428,10 +1591,12 @@ export default function App() {
       });
       call.on('error', (err: any) => {
         if (incomingCallsRef.current.get(call.peer) === call) incomingCallsRef.current.delete(call.peer);
+        clearIncomingStatsLogger(call.peer);
         console.warn('[Voice] Incoming call error from', call.peer, err);
       });
       call.on('close', () => {
         if (incomingCallsRef.current.get(call.peer) === call) incomingCallsRef.current.delete(call.peer);
+        clearIncomingStatsLogger(call.peer);
         const iceState = (call.peerConnection as RTCPeerConnection | undefined)?.iceConnectionState;
         console.log('[Voice] Incoming call closed from', call.peer, '- ICE state at close:', iceState ?? 'unknown');
         const callerId = Object.keys(remotePlayersRef.current).find(id => remotePlayersRef.current[id].peerId === call.peer);
@@ -1448,6 +1613,10 @@ export default function App() {
         } catch {}
       }
       incomingCallsRef.current.clear();
+      for (const intervalId of incomingStatsIntervalByPeerId.current.values()) {
+        window.clearInterval(intervalId);
+      }
+      incomingStatsIntervalByPeerId.current.clear();
     };
   }, [attachRemoteStreamByPeerId, createSilentStream]);
 
