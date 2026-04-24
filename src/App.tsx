@@ -4,7 +4,8 @@ import Peer from 'peerjs';
 import { 
   Mic, MicOff, LogOut, Sun, Moon, 
   Monitor, Volume2, Building2, Users, 
-  MapPin, Headphones, ArrowRight, Check, ChevronUp
+  MapPin, Headphones, ArrowRight, Check, ChevronUp,
+  Settings, AudioLines
 } from 'lucide-react';
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -117,14 +118,60 @@ async function resolveIceServers(): Promise<RTCIceServer[]> {
 
     const data = await res.json();
     if (Array.isArray(data?.iceServers) && data.iceServers.length > 0) {
+      console.log('[Voice] ICE servers from /api/ice-servers:', JSON.stringify(data.iceServers.map((s: any) => s.urls)));
       return data.iceServers;
     }
 
     throw new Error('ICE server endpoint returned no iceServers');
   } catch (error) {
-    console.warn('Falling back to static ICE server configuration.', error);
+    console.warn('[Voice] Falling back to static ICE server configuration.', error);
     return parseIceServersFromEnv();
   }
+}
+
+/**
+ * Probe whether we can gather a TURN relay candidate.
+ * Runs a quick ICE gather and resolves true/false.
+ */
+async function testTurnConnectivity(iceServers: RTCIceServer[]): Promise<boolean> {
+  const hasTurn = iceServers.some(s => {
+    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+    return urls.some(u => u.startsWith('turn:') || u.startsWith('turns:'));
+  });
+  if (!hasTurn) {
+    console.warn('[Voice] ⚠ No TURN servers configured — only STUN available. Audio may fail across different networks.');
+    return false;
+  }
+
+  return new Promise<boolean>((resolve) => {
+    const pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 0 });
+    let foundRelay = false;
+    const timeout = setTimeout(() => {
+      pc.close();
+      if (!foundRelay) {
+        console.error('[Voice] ❌ TURN server unreachable — coturn may not be running. Audio will NOT work across different networks.');
+        console.error('[Voice]    Run: sudo bash scripts/setup_coturn.sh on your VM');
+      }
+      resolve(foundRelay);
+    }, 5000);
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate?.type === 'relay') {
+        foundRelay = true;
+        clearTimeout(timeout);
+        pc.close();
+        console.log('[Voice] ✅ TURN relay candidate gathered — TURN server is reachable!');
+        resolve(true);
+      }
+    };
+
+    pc.createDataChannel('turn-test');
+    pc.createOffer().then(offer => pc.setLocalDescription(offer)).catch(() => {
+      clearTimeout(timeout);
+      pc.close();
+      resolve(false);
+    });
+  });
 }
 
 function buildPeerOptions(iceServers: RTCIceServer[]) {
@@ -688,6 +735,25 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
           }, CALL_CONNECT_TIMEOUT_MS);
 
           activeCalls.current.set(p.id, { call, streamAdded: false, timeoutId });
+
+          // Monitor ICE connection state to diagnose TURN / connectivity issues
+          try {
+            const pc = call.peerConnection as RTCPeerConnection | undefined;
+            if (pc) {
+              pc.oniceconnectionstatechange = () => {
+                console.log('[Voice] ICE state for', p.name, ':', pc.iceConnectionState);
+                if (pc.iceConnectionState === 'failed') {
+                  console.error('[Voice] ICE FAILED for', p.name, '— TURN server may be unreachable');
+                }
+              };
+              pc.onicecandidate = (e) => {
+                if (e.candidate) {
+                  console.log('[Voice] ICE candidate:', e.candidate.type, e.candidate.protocol, e.candidate.address);
+                }
+              };
+            }
+          } catch (_) {}
+
           call.on('stream', (s: MediaStream) => { 
             console.log('[Voice] Got stream from', p.peerId, '(player', p.id, ') — tracks:', s.getTracks().length);
             audioEngine?.addRemoteStream(p.id, s); 
@@ -709,7 +775,7 @@ const OfficeCanvas = ({ userName, userColor, audioEnabled, audioMuted, hearingRa
           call.on('error', (e: any) => {
             const activeCall = activeCalls.current.get(p.id);
             if (activeCall?.timeoutId != null) window.clearTimeout(activeCall.timeoutId);
-            console.warn('Call error', e);
+            console.warn('[Voice] Call error', e);
             audioEngine?.removeUser(p.id);
             activeCalls.current.delete(p.id);
           });
@@ -877,6 +943,7 @@ export default function App() {
   const [selectedOutputDeviceId, setSelectedOutputDeviceId] = useState('default');
   const [canSelectOutputDevice, setCanSelectOutputDevice] = useState(false);
   const [audioMenuOpen, setAudioMenuOpen] = useState(false);
+  const [noiseReduction, setNoiseReduction] = useState(true);
 
   const socketRef = useRef<Socket | null>(null);
   const peerRef = useRef<Peer | null>(null);
@@ -990,13 +1057,14 @@ export default function App() {
 
   const getMicStream = useCallback(async (): Promise<MediaStream> => {
     const preferredConstraints = buildPreferredMicConstraints();
+    const withNR = { ...preferredConstraints, noiseSuppression: noiseReduction };
     const requestedAudioConstraints =
       selectedInputDeviceId !== 'default'
         ? ({
-            ...preferredConstraints,
+            ...withNR,
             deviceId: { ideal: selectedInputDeviceId },
           } as MediaTrackConstraints)
-        : preferredConstraints;
+        : withNR;
 
     let stream: MediaStream;
     try {
@@ -1007,9 +1075,10 @@ export default function App() {
         selectedInputDeviceId !== 'default'
           ? ({
               ...MIC_AUDIO_CONSTRAINTS,
+              noiseSuppression: noiseReduction,
               deviceId: { ideal: selectedInputDeviceId },
             } as MediaTrackConstraints)
-          : MIC_AUDIO_CONSTRAINTS;
+          : { ...MIC_AUDIO_CONSTRAINTS, noiseSuppression: noiseReduction };
       stream = await navigator.mediaDevices.getUserMedia({
         audio: fallbackConstraints,
       });
@@ -1020,7 +1089,7 @@ export default function App() {
     await refreshAudioDevices().catch(() => {});
 
     return stream;
-  }, [refreshAudioDevices, selectedInputDeviceId]);
+  }, [refreshAudioDevices, selectedInputDeviceId, noiseReduction]);
 
   const registerPeerCallHandlers = useCallback((peer: Peer) => {
     const handleCall = (call: any) => {
@@ -1092,6 +1161,9 @@ export default function App() {
       
       // Initialize audio engine as soon as we join, so we are ready to handle incoming calls
       audioEngineRef.current.init().catch(console.error);
+
+      // Probe TURN connectivity in background — logs a clear ✅ or ❌
+      testTurnConnectivity(iceServers).catch(() => {});
 
       // Keep a silent outbound audio track by default. This allows proximity calls
       // to establish even before the user enables their microphone.
@@ -1276,59 +1348,92 @@ export default function App() {
             <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex items-center p-1.5 bg-[var(--color-bg-card)]/90 backdrop-blur-xl rounded-full border border-[var(--color-border)] shadow-2xl z-30">
               <div ref={audioMenuRef} className="relative flex items-center">
                 {audioMenuOpen && (
-                  <div className="absolute bottom-full left-0 mb-3 w-80 rounded-3xl border border-[var(--color-border)] bg-[#1b1f23]/96 p-3 text-left shadow-2xl backdrop-blur-xl">
-                    <div className="px-3 pb-2 pt-1 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">Select Microphone</div>
-                    <button
-                      onClick={() => { handleInputDeviceChange('default'); }}
-                      className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
-                    >
-                      <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedInputDeviceId === 'default' ? <Check className="h-4 w-4" /> : null}</div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-medium text-white">System Default</div>
-                        <div className="truncate text-xs text-[var(--color-text-muted)]">Default microphone</div>
-                      </div>
-                    </button>
-                    {audioInputDevices.map((device) => (
-                      <button
-                        key={device.deviceId}
-                        onClick={() => { handleInputDeviceChange(device.deviceId); }}
-                        className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
-                      >
-                        <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedInputDeviceId === device.deviceId ? <Check className="h-4 w-4" /> : null}</div>
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium text-white">{getDeviceLabel(device, 'Microphone')}</div>
-                        </div>
-                      </button>
-                    ))}
-
-                    <div className="my-2 h-px bg-white/8" />
-                    <div className="px-3 pb-2 pt-1 text-xs font-semibold uppercase tracking-wider text-[var(--color-text-muted)]">Select Speaker</div>
-                    <button
-                      onClick={() => { handleOutputDeviceChange('default'); }}
-                      className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
-                    >
-                      <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedOutputDeviceId === 'default' ? <Check className="h-4 w-4" /> : null}</div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-medium text-white">System Default</div>
-                        <div className="truncate text-xs text-[var(--color-text-muted)]">Default speaker</div>
-                      </div>
-                    </button>
-                    {canSelectOutputDevice ? (
-                      audioOutputDevices.map((device) => (
+                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 w-80 rounded-2xl border border-white/10 bg-[#1e2226]/98 py-2 text-left shadow-2xl backdrop-blur-2xl">
+                    {/* ── Select Microphone ── */}
+                    <div className="px-4 pb-1.5 pt-2 text-[11px] font-semibold text-[#9aa0a6] tracking-wide">Select microphone</div>
+                    {audioInputDevices.map((device) => {
+                      const isSelected = selectedInputDeviceId === device.deviceId;
+                      return (
                         <button
                           key={device.deviceId}
-                          onClick={() => { handleOutputDeviceChange(device.deviceId); }}
-                          className="flex w-full items-start gap-3 rounded-2xl px-3 py-2 text-left transition hover:bg-white/5"
+                          onClick={() => handleInputDeviceChange(device.deviceId)}
+                          className="flex w-full items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-white/[0.06]"
                         >
-                          <div className="mt-1 h-4 w-4 shrink-0 text-[var(--color-accent)]">{selectedOutputDeviceId === device.deviceId ? <Check className="h-4 w-4" /> : null}</div>
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-medium text-white">{getDeviceLabel(device, 'Speaker')}</div>
-                          </div>
+                          <div className="h-4 w-4 shrink-0">{isSelected ? <Check className="h-4 w-4 text-[#8ab4f8]" /> : null}</div>
+                          <span className={cn("text-[13px] truncate", isSelected ? "font-medium text-white" : "text-[#e8eaed]")}>{getDeviceLabel(device, 'Microphone')}</span>
                         </button>
-                      ))
-                    ) : (
-                      <div className="px-3 py-2 text-sm text-[var(--color-text-muted)]">This browser does not support selecting a speaker output device.</div>
+                      );
+                    })}
+                    {audioInputDevices.length === 0 && (
+                      <button
+                        onClick={() => handleInputDeviceChange('default')}
+                        className="flex w-full items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-white/[0.06]"
+                      >
+                        <div className="h-4 w-4 shrink-0"><Check className="h-4 w-4 text-[#8ab4f8]" /></div>
+                        <div className="min-w-0">
+                          <div className="text-[13px] font-medium text-white">System Default</div>
+                          <div className="text-[11px] text-[#9aa0a6]">Default</div>
+                        </div>
+                      </button>
                     )}
+
+                    {/* ── Select Speaker ── */}
+                    <div className="my-1.5 h-px bg-white/[0.08]" />
+                    <div className="px-4 pb-1.5 pt-1.5 text-[11px] font-semibold text-[#9aa0a6] tracking-wide">Select speaker</div>
+                    {canSelectOutputDevice ? (
+                      <>
+                        {audioOutputDevices.map((device) => {
+                          const isSelected = selectedOutputDeviceId === device.deviceId;
+                          return (
+                            <button
+                              key={device.deviceId}
+                              onClick={() => handleOutputDeviceChange(device.deviceId)}
+                              className="flex w-full items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-white/[0.06]"
+                            >
+                              <div className="h-4 w-4 shrink-0">{isSelected ? <Check className="h-4 w-4 text-[#8ab4f8]" /> : null}</div>
+                              <span className={cn("text-[13px] truncate", isSelected ? "font-medium text-white" : "text-[#e8eaed]")}>{getDeviceLabel(device, 'Speaker')}</span>
+                            </button>
+                          );
+                        })}
+                        {audioOutputDevices.length === 0 && (
+                          <button
+                            onClick={() => handleOutputDeviceChange('default')}
+                            className="flex w-full items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-white/[0.06]"
+                          >
+                            <div className="h-4 w-4 shrink-0"><Check className="h-4 w-4 text-[#8ab4f8]" /></div>
+                            <div className="min-w-0">
+                              <div className="text-[13px] font-medium text-white">System Default</div>
+                              <div className="text-[11px] text-[#9aa0a6]">Default</div>
+                            </div>
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <div className="px-4 py-2 text-[13px] text-[#9aa0a6]">Speaker selection not supported in this browser.</div>
+                    )}
+
+                    {/* ── Noise Reduction ── */}
+                    <div className="my-1.5 h-px bg-white/[0.08]" />
+                    <button
+                      onClick={() => setNoiseReduction(prev => !prev)}
+                      className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-white/[0.06]"
+                    >
+                      <AudioLines className="h-4 w-4 shrink-0 text-[#e8eaed]" />
+                      <span className="flex-1 text-[13px] text-[#e8eaed]">Noise reduction</span>
+                      <div className={cn("relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors duration-200", noiseReduction ? "bg-[#8ab4f8]" : "bg-[#5f6368]")}
+                      >
+                        <span className={cn("inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform duration-200", noiseReduction ? "translate-x-[18px]" : "translate-x-[3px]")} />
+                      </div>
+                    </button>
+
+                    {/* ── Audio Settings ── */}
+                    <button
+                      onClick={() => { setAudioMenuOpen(false); }}
+                      className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-white/[0.06]"
+                    >
+                      <Settings className="h-4 w-4 shrink-0 text-[#e8eaed]" />
+                      <span className="text-[13px] text-[#e8eaed]">Audio settings</span>
+                    </button>
                   </div>
                 )}
                 <button onClick={!audioEnabled ? handleEnableAudio : handleToggleMute} className={cn("w-12 h-12 flex shrink-0 items-center justify-center rounded-full transition-all duration-300", !audioEnabled ? "bg-[var(--color-accent)] text-white animate-pulse" : audioMuted ? "bg-red-500 text-white" : "bg-[var(--color-bg-secondary)] hover:bg-[var(--color-border)]")}>
